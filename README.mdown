@@ -1,0 +1,18 @@
+## regression-classification
+
+The present repository is meant to provide some model examples of solving regression and classification problems using *neural networks* (NN).
+
+#### Quadrant.
+
+You need to install [Torch](http://torch.ch/)
+to run the corresponding Lua script:
+
+```
+th nn_quadrant.lua
+```
+
+In this model, one trains a NN to recognize the coordinate quadrant of a point on a 2d plane.
+The program generates first a random training dataset of 10.000 points taken from a 2d standard Gaussian distribution.
+For each point the quadrant is known (supervised learning). 
+The neural network constructed in the file is then trained via *stochastic gradient method* with respect to *cross entropy criterion*.
+
