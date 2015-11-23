@@ -25,18 +25,26 @@ data Dist = NormalDist (R, R)   -- distributions to generate examples
 
 instance NFData Dist
 
-data NL = SoftmaxNL   -- NL stands for nonlinearity
-        | SigmoidNL
-        | IdNL
-        | TanhNL
-        | SoftplusNL
+data NL = IdNL
         | ReluNL
+        | SigmoidNL
+        | SoftmaxNL   -- NL stands for nonlinearity
+        | SoftplusNL
+        | TanhNL
   deriving (Show, Read, Eq, Enum, GHC.Generic)
 
 instance NFData NL
 
+data LR = LR { _initialLR :: R }
+  deriving (Show, Read, Eq, GHC.Generic)
+makeLenses ''LR
+
+instance NFData LR
+
+---
+
 data Config = Config { _epsilonInit :: R
-                     , _learningRate :: R
+                     , _learningRate :: LR
                      , _regParameter :: R
                      , _numIterations :: Int
                      , _numExamples :: Int
@@ -50,16 +58,18 @@ data Config = Config { _epsilonInit :: R
 makeLenses ''Config
 
 instance Default Config where
-  def = Config { _epsilonInit = 0.1
-               , _learningRate = 3.0
+  def = Config { _epsilonInit = 1
+               , _learningRate = LR { _initialLR = 0.03 } 
                , _regParameter = 0.1 
                , _numIterations = 100
                , _numExamples = 1000
                , _coordDist = UniformDist (-1, 1)
                , _numDisplayedDigits = 16
                , _topOutput = (4, SoftmaxNL)
-               , _hiddenOutputs = [ (32, TanhNL) -- closest to top
-                                  , (32, TanhNL)
+               , _hiddenOutputs = [ (128, TanhNL) -- closest to top
+                                  , (128, TanhNL)
+                                  , (128, TanhNL)
+                                  , (128, TanhNL)
                                   ]
                , _numInputs = 2
                }
@@ -78,6 +88,7 @@ data Layer = Layer { _weights :: Matrix R
                    , _deviations :: Vector R
                    , _emitNL :: NL
                    , _absorbNL :: NL
+                   , _learningRates :: Vector R 
                    }
   deriving (Show, Read, Eq, GHC.Generic)
 makeLenses ''Layer
@@ -105,6 +116,7 @@ createLayer (nlOut, nlIn) mat =
             , _deviations = konst 0 (n - 1)
             , _emitNL = nlOut
             , _absorbNL = nlIn
+            , _learningRates = konst 0 m
             }
 
 createNN :: (NL, Matrix R) -> [(NL, Matrix R)] -> NN
@@ -117,6 +129,18 @@ createNN (nlTop, mTop) = \case
        , _mHiddenNN = Just $ createNN (nl1, mat1) zs
        }
 
+-- local learning rates ~ sqrt N, N = #fan-in >> 1
+reifyLayerLearningRates :: Config -> Layer -> Layer
+reifyLayerLearningRates c l =
+  let alpha = c ^. (learningRate . initialLR)
+      (m, n) = size (l ^. weights)
+   in l & learningRates .~ konst (alpha * (sqrt ((fromInteger . fromIntegral) n))) m
+
+reifyLearningRatesNN :: Config -> NN -> NN
+reifyLearningRatesNN c nn =
+   nn & topNN %~ reifyLayerLearningRates c
+      & mHiddenNN . _Just %~ reifyLearningRatesNN c
+
 ----------
 
 newRandomMatrix :: (R, R) -> (Int, Int) -> IO (Matrix R)
@@ -127,14 +151,17 @@ newRandomMatrix valRange (numRows, numCols) = do
     take (numRows * numCols) $
     randomRs valRange g
 
+-- initial weights ~ 1 / (sqrt N), N = #fan-in >> 1
 initMatrices :: (R, R) -> (Int, [Int]) -> Int
       -> IO (Matrix R, [Matrix R])
 initMatrices r (nOut, nHUs) nIn = case nHUs of 
   [] -> do
-    t <- newRandomMatrix r (nOut, nIn + 1)
+    let coeff = 1 / (sqrt ((fromInteger . fromIntegral) (nIn + 1)))
+    t <- newRandomMatrix (r & each %~ (* coeff)) (nOut, nIn + 1)
     return $ (t, [])
   nHU : nHUs' -> do
-    t <- newRandomMatrix r (nOut, nHU + 1)
+    let coeff = 1 / (sqrt ((fromInteger . fromIntegral) (nHU + 1)))
+    t <- newRandomMatrix (r & each %~ (* coeff)) (nOut, nHU + 1)
     (t1, ts) <- initMatrices r (nHU, nHUs') nIn
     return $ (t, t1 : ts)
 
@@ -143,12 +170,14 @@ initMatrices r (nOut, nHUs) nIn = case nHUs of
 initNN :: Config -> IO NN
 initNN c = do
   (t, ms) <- initMatrices (-eps, eps) (nOut, nHUs) nIn
-  return $ createNN (nlOut, t) (zip nlHUs ms)
-    where
-      eps = c ^. epsilonInit
-      (nOut, nlOut) = c ^. topOutput
-      (nHUs, nlHUs) = unzip $ c ^. hiddenOutputs
-      nIn = c ^. numInputs 
+  return $
+    reifyLearningRatesNN c $
+    createNN (nlOut, t) (zip nlHUs ms)
+      where
+        eps = c ^. epsilonInit
+        (nOut, nlOut) = c ^. topOutput
+        (nHUs, nlHUs) = unzip $ c ^. hiddenOutputs
+        nIn = c ^. numInputs 
 
 ----------
 
@@ -172,7 +201,10 @@ softplus :: R -> R
 softplus z = log (1 + (exp z))
 
 relu :: R -> R
-relu x = if (x > 0) then x else 0
+relu z = if (z > 0) then z else 0
+
+tanhOpt :: R -> R
+tanhOpt z = tanh (2 * z / 3) / (tanh (2 / 3))
 
 ----------
 
@@ -200,7 +232,7 @@ forwardId x = do
 forwardTanh :: (MonadState Layer m) => Vector R -> m (Vector R)
 forwardTanh x = do
   a <- forwardLinear x
-  return $ cmap tanh a 
+  return $ cmap tanhOpt a 
 
 forwardSoftplus :: (MonadState Layer m) => Vector R -> m (Vector R)
 forwardSoftplus x = do
@@ -347,10 +379,7 @@ resetADGNN :: (Functor (Zoomed m1 ()), Functor (Zoomed m2 ()),
      m ()
 resetADGNN = do
   zoom topNN $ resetLayerADG
-  mh <- use mHiddenNN
-  case mh of
-    Nothing -> return ()
-    Just _ -> zoom (mHiddenNN . _Just) $ resetADGNN
+  zoom (mHiddenNN . _Just) $ resetADGNN
 
 ---
 
@@ -370,10 +399,7 @@ updateGradientsNN :: (Functor (Zoomed m1 ()), Functor (Zoomed m2 ()),
      m ()
 updateGradientsNN = do
   zoom topNN $ updateLayerGradients
-  mh <- use mHiddenNN
-  case mh of
-    Nothing -> return ()
-    Just _ -> zoom (mHiddenNN . _Just) $ updateGradientsNN
+  zoom (mHiddenNN . _Just) $ updateGradientsNN
 
 learnExampleNN :: (Functor (Zoomed m1 ()),
       Functor (Zoomed m1 (Vector R)),
@@ -399,13 +425,13 @@ learnNN = mapMOf traverse $ learnExampleNN
 updateLayerWeights :: (Functor (Zoomed m1 ()), 
       Zoom m1 m Grad Layer) => Config -> m ()
 updateLayerWeights c = do 
-  let alpha = c ^. learningRate
+  alphas <- use learningRates
   let lambda = c ^. regParameter
   gn <- use gradients
   let g = gn ^. accGrad
   let n = gn ^. counterGrad
-  let coeff = (- alpha) / ((fromInteger . fromIntegral) n)
-  weights %= (\m -> m * (scalar (1 + lambda * coeff)) + g * (scalar coeff))
+  let coeff = (-1) / ((fromInteger . fromIntegral) n)  
+  weights %= (\m -> mul (diag (cmap (\a -> 1 + a * lambda * coeff) alphas)) m + mul (diag (alphas * (scalar coeff))) g)
   resetLayerGradients
 
 updateWeightsNN :: (Functor (Zoomed m1 ()),
@@ -415,10 +441,7 @@ updateWeightsNN :: (Functor (Zoomed m1 ()),
      Config -> m ()
 updateWeightsNN c = do
   zoom topNN $ updateLayerWeights c
-  mh <- use mHiddenNN
-  case mh of
-    Nothing -> return ()
-    Just _ -> zoom (mHiddenNN . _Just) $ updateWeightsNN c
+  zoom (mHiddenNN . _Just) $ updateWeightsNN c
 
 trainOnceNN :: (Functor (Zoomed m1 ()),
       Functor (Zoomed m1 (Vector R)),
@@ -474,18 +497,15 @@ newNormalRandomVectors (mu, sigma) n d = do
   g <- newStdGen
   return $ fmap vector $ take n $ chunksOf d $ normals' (mu, sigma) g
 
-
 newUniformRandomVectors :: (R, R) -> Int -> Int -> IO [Vector R]
 newUniformRandomVectors r n d = do
   g <- newStdGen
   return $ fmap vector $ take n $ chunksOf d $ randomRs r g
 
-
 newRandomVectors :: Config -> Int -> Int -> IO [Vector R]
 newRandomVectors c n d = case (c ^. coordDist) of
   NormalDist (mu, sigma) -> newNormalRandomVectors (mu, sigma) n d
   UniformDist (r1, r2) -> newUniformRandomVectors (r1, r2) n d
-
 
 quadrantVec :: Vector R -> Vector R
 quadrantVec v = vector $
@@ -500,6 +520,7 @@ quadrantVec v = vector $
     else [0.0, 0.0, 1.0, 0.0]
     where x = v ! 0
           y = v ! 1
+
 
 newRandomQuadrantExamples :: Config -> IO ([(Vector R, Vector R)])
 newRandomQuadrantExamples c = do
@@ -564,3 +585,4 @@ main = do
   return ()
 
 ----------
+
