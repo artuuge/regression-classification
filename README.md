@@ -2,18 +2,6 @@
 
 The present repository is meant to provide some model examples of solving regression and classification problems using *neural networks* (NN).
 
-### Quadrant
-
-You need to install [Torch](http://torch.ch/)
-to run the corresponding Lua script:
-```
-th nn_quadrant.lua
-```
-In this model, one trains a NN to recognize the coordinate quadrant of a point on a 2d plane.
-The program generates first a random training dataset of 10.000 points taken from a 2d standard Gaussian distribution.
-For each point the quadrant is known (supervised learning). 
-The neural network constructed in the file is then trained via *stochastic gradient method* with respect to *cross entropy criterion*.
-
 ### Linear
 
 Multivariate linear regression can be perceived as a very simple case of the machine learning theory (ML) corresponding to a neural network consisting of a single linear layer. If we have *n* independent variables (features) and *k* dependent variables (targets), then this layer has *n* inputs and *k* outputs. The case *(k, n) = (1, 1)* corresponds to a real valued linear function of one real variable, and the network reduces to a single neuron with just one non-intercept input. The present example defines a straightforward implementation in [Haskell](https://www.haskell.org/platform/) 
